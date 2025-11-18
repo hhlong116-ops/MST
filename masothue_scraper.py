@@ -1,41 +1,133 @@
+"""
+Scraper masothue.com:
+- Đọc danh sách MST từ file Excel
+- Với mỗi MST -> lên trang Search -> tìm link có chứa đúng MST trong href
+- Vào trang chi tiết đó, lấy thông tin và ghi ra file Excel mới
+"""
+
+from __future__ import annotations
+
 import argparse
 import sys
 import time
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://masothue.com"
-UA = {
-    "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537.36"
+    ),
     "Accept-Language": "vi-VN,vi;q=0.9",
 }
 
 
-def fetch_by_mst(mst: str, timeout=15.0) -> Dict[str, str]:
-    url = f"{BASE_URL}/{mst}"
+class ScrapeError(Exception):
+    pass
 
-    r = requests.get(url, headers=UA, timeout=timeout)
-    if r.status_code != 200:
-        raise Exception(f"HTTP {r.status_code} cho {url}")
 
-    soup = BeautifulSoup(r.text, "html.parser")
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Tra cứu thông tin doanh nghiệp từ masothue.com theo danh sách MST trong file Excel."
+    )
+    parser.add_argument("input", help="Đường dẫn file Excel đầu vào.")
+    parser.add_argument(
+        "--column",
+        default="tax_id",
+        help="Tên cột chứa MST trong file Excel (mặc định: tax_id).",
+    )
+    parser.add_argument(
+        "--sheet",
+        default=0,
+        help="Tên hoặc index sheet (mặc định: 0).",
+    )
+    parser.add_argument(
+        "--output",
+        default="masothue_results.xlsx",
+        help="File Excel kết quả (mặc định: masothue_results.xlsx).",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.0,
+        help="Delay (giây) giữa các request để tránh bị chặn (mặc định: 1s).",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        help="Timeout cho mỗi request HTTP (mặc định: 15s).",
+    )
+    return parser.parse_args(argv)
 
-    data = {
-        "tax_id": mst,
-        "masothue_url": url
+
+def find_detail_url_for_tax_id(tax_id: str, timeout: float = 15.0) -> str:
+    """
+    Lên trang Search của masothue, tìm link chi tiết có chứa đúng MST trong href.
+    Ví dụ:
+      tax_id = '0100106264'
+      href  = '/0100106264-cong-ty-co-phan-van-tai-duong-sat-ha-noi'
+    hoặc:
+      tax_id = '0100106264-011'
+      href  = '/0100106264-011-chi-nhanh-...'
+    """
+
+    search_url = f"{BASE_URL}/Search/?q={tax_id}"
+    resp = requests.get(search_url, headers=HEADERS, timeout=timeout)
+    if resp.status_code != 200:
+        raise ScrapeError(f"Không tải được {search_url} (HTTP {resp.status_code})")
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Chuỗi MST đúng dạng trong href (có thể có dấu '-')
+    needle = f"/{tax_id}-"   # ví dụ: '/0100106264-' hoặc '/0100106264-011-'
+
+    candidate = None
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if needle in href:
+            candidate = href
+            break
+
+    if candidate is None:
+        raise ScrapeError(f"Không tìm thấy link chứa MST {tax_id} trên trang search.")
+
+    if candidate.startswith("http"):
+        return candidate
+    return BASE_URL + candidate
+
+
+def fetch_tax_info(tax_id: str, timeout: float = 15.0) -> Dict[str, str]:
+    """
+    Từ MST:
+      1. Tìm URL chi tiết bằng find_detail_url_for_tax_id()
+      2. Vào URL, parse HTML, lấy thông tin bảng 2 cột
+    """
+
+    detail_url = find_detail_url_for_tax_id(tax_id, timeout=timeout)
+
+    resp = requests.get(detail_url, headers=HEADERS, timeout=timeout)
+    if resp.status_code != 200:
+        raise ScrapeError(f"Không tải được {detail_url} (HTTP {resp.status_code})")
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    data: Dict[str, str] = {
+        "tax_id": tax_id,
+        "masothue_url": detail_url,
     }
 
-    # Lấy tên doanh nghiệp từ <h1>
-    h1 = soup.find("h1")
-    if h1:
-        data["Tên doanh nghiệp"] = h1.get_text(strip=True)
+    # Tên doanh nghiệp: thường là <h1>
+    title = soup.find("h1")
+    if title:
+        data["Tên doanh nghiệp"] = title.get_text(strip=True)
 
-    # Lấy mọi bảng 2 cột
+    # Lấy các bảng dạng 2 cột
     for table in soup.find_all("table"):
         for tr in table.find_all("tr"):
             tds = tr.find_all(["th", "td"])
@@ -43,58 +135,71 @@ def fetch_by_mst(mst: str, timeout=15.0) -> Dict[str, str]:
                 continue
             label = tds[0].get_text(" ", strip=True)
             value = tds[1].get_text(" ", strip=True)
-            data[label] = value
+            if label and label not in data:
+                data[label] = value
+
+    if len(data) <= 2:
+        # chỉ có tax_id + masothue_url -> coi như không có dữ liệu
+        raise ScrapeError(f"Không đọc được dữ liệu hữu ích cho MST {tax_id}.")
 
     return data
 
 
-def enrich_excel(input_path, output_path, column="tax_id",
-                 sheet=0, delay=1.0, timeout=15.0):
-
+def enrich_excel(
+    input_path: str,
+    output_path: str,
+    column: str = "tax_id",
+    sheet: str | int = 0,
+    delay: float = 1.0,
+    timeout: float = 15.0,
+) -> pd.DataFrame:
     df = pd.read_excel(input_path, sheet_name=sheet)
-
     if column not in df.columns:
-        raise Exception(f"Không tìm thấy cột {column}")
+        raise ValueError(
+            f"Không tìm thấy cột '{column}' trong file Excel. Các cột có: {list(df.columns)}"
+        )
 
-    results = []
     total = len(df)
+    results: List[Dict[str, str]] = []
 
-    for idx, v in enumerate(df[column], start=1):
-        mst = str(v).strip()
-        if not mst:
+    for idx, raw in enumerate(df[column], start=1):
+        tax_id = str(raw).strip()
+        if not tax_id:
             continue
-
         try:
-            info = fetch_by_mst(mst, timeout=timeout)
-            print(f"[{idx}/{total}] ✅ {mst}")
+            info = fetch_tax_info(tax_id, timeout=timeout)
             results.append(info)
-        except Exception as ex:
-            print(f"[{idx}/{total}] ❌ {mst}: {ex}")
-
+            print(f"[{idx}/{total}] ✅ {tax_id} → {info.get('Tên doanh nghiệp', '')}")
+        except Exception as exc:
+            print(f"[{idx}/{total}] ❌ {tax_id}: {exc}")
         time.sleep(delay)
 
     if not results:
-        raise Exception("Không lấy được dữ liệu nào.")
+        raise ScrapeError("Không lấy được dữ liệu nào. Vui lòng kiểm tra danh sách mã.")
 
-    newdf = pd.DataFrame(results)
-    merged = df.merge(newdf, how="left", left_on=column, right_on="tax_id")
-    merged.to_excel(output_path, index=False)
-    print("Đã lưu:", output_path)
+    result_df = pd.DataFrame(results)
+    output_df = df.merge(result_df, how="left", left_on=column, right_on="tax_id")
+    output_df.to_excel(output_path, index=False)
+    print(f"Đã lưu kết quả vào {output_path}")
+    return output_df
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input")
-    parser.add_argument("--column", default="tax_id")
-    parser.add_argument("--sheet", default=0)
-    parser.add_argument("--output", default="result.xlsx")
-    parser.add_argument("--delay", type=float, default=1.0)
-    parser.add_argument("--timeout", type=float, default=15.0)
-    args = parser.parse_args(argv)
-
-    enrich_excel(args.input, args.output, args.column,
-                 args.sheet, args.delay, args.timeout)
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    try:
+        enrich_excel(
+            input_path=args.input,
+            output_path=args.output,
+            column=args.column,
+            sheet=args.sheet,
+            delay=args.delay,
+            timeout=args.timeout,
+        )
+        return 0
+    except Exception as exc:
+        print(exc, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
