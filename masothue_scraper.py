@@ -1,7 +1,7 @@
 """
 Scraper masothue.com:
 - Đọc danh sách MST từ file Excel
-- Với mỗi MST -> lên trang Search -> tìm link có chứa đúng MST trong href
+- Với mỗi MST -> gọi endpoint auto search -> lấy link chi tiết
 - Vào trang chi tiết đó, lấy thông tin và ghi ra file Excel mới
 """
 
@@ -68,24 +68,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def find_detail_url_for_tax_id(tax_id: str, timeout: float = 15.0) -> str:
     """
-    Lên trang Search của masothue, tìm link chi tiết có chứa đúng MST trong href.
+    Gọi endpoint auto search của masothue:
+      https://masothue.com/Search/?type=auto&q=<MST>
+    Sau đó tìm <a href="..."> có chứa '/<MST>-' trong href.
     Ví dụ:
       tax_id = '0100106264'
-      href  = '/0100106264-cong-ty-co-phan-van-tai-duong-sat-ha-noi'
-    hoặc:
-      tax_id = '0100106264-011'
-      href  = '/0100106264-011-chi-nhanh-...'
+      href   = '/0100106264-cong-ty-co-phan-van-tai-duong-sat-ha-noi'
     """
 
-    search_url = f"{BASE_URL}/Search/?q={tax_id}"
+    # dùng endpoint type=auto đúng như trong JSON-LD của site
+    search_url = f"{BASE_URL}/Search/?type=auto&q={tax_id}"
     resp = requests.get(search_url, headers=HEADERS, timeout=timeout)
     if resp.status_code != 200:
         raise ScrapeError(f"Không tải được {search_url} (HTTP {resp.status_code})")
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Chuỗi MST đúng dạng trong href (có thể có dấu '-')
-    needle = f"/{tax_id}-"   # ví dụ: '/0100106264-' hoặc '/0100106264-011-'
+    needle = f"/{tax_id}-"  # chuỗi cần tìm trong href
 
     candidate = None
     for a in soup.find_all("a", href=True):
@@ -95,7 +94,7 @@ def find_detail_url_for_tax_id(tax_id: str, timeout: float = 15.0) -> str:
             break
 
     if candidate is None:
-        raise ScrapeError(f"Không tìm thấy link chứa MST {tax_id} trên trang search.")
+        raise ScrapeError(f"Không tìm thấy link chứa MST {tax_id} trên trang auto search.")
 
     if candidate.startswith("http"):
         return candidate
