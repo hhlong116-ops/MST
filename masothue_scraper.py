@@ -1,6 +1,5 @@
 """
-Utility to fetch business details from https://masothue.com for a list of tax IDs
-and export the results to an Excel spreadsheet.
+Utility to fetch business details from https://masothue.com for a list of tax IDs.
 """
 
 from __future__ import annotations
@@ -23,253 +22,170 @@ USER_AGENT = (
 
 
 class ScrapeError(Exception):
-    """Raised when a tax ID cannot be scraped."""
+    pass
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Tải thông tin doanh nghiệp từ masothue.com và xuất ra file Excel mới."
-        )
+        description="Tải thông tin từ masothue.com"
     )
-    parser.add_argument(
-        "input",
-        help="Đường dẫn đến file Excel chứa danh sách mã số thuế.",
-    )
-    parser.add_argument(
-        "--column",
-        default="tax_id",
-        help=(
-            "Tên cột trong file Excel chứa mã số thuế. Mặc định: tax_id. "
-            "Có thể trỏ đến bất kỳ cột nào chứa mã số thuế."
-        ),
-    )
-    parser.add_argument(
-        "--sheet",
-        default=0,
-        help=(
-            "Tên hoặc chỉ số sheet cần đọc trong Excel. Mặc định là sheet đầu tiên."
-        ),
-    )
-    parser.add_argument(
-        "--output",
-        default="masothue_results.xlsx",
-        help="Đường dẫn file Excel xuất kết quả. Mặc định: masothue_results.xlsx",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=1.0,
-        help="Độ trễ (giây) giữa các request để tránh bị chặn. Mặc định: 1 giây.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=15.0,
-        help="Timeout (giây) cho mỗi request HTTP. Mặc định: 15 giây.",
-    )
+    parser.add_argument("input")
+    parser.add_argument("--column", default="tax_id")
+    parser.add_argument("--sheet", default=0)
+    parser.add_argument("--output", default="masothue_results.xlsx")
+    parser.add_argument("--delay", type=float, default=1.0)
+    parser.add_argument("--timeout", type=float, default=15.0)
     return parser.parse_args(argv)
 
 
-# Link chi tiết thường dạng /0100106264-cong-ty-... hoặc /0100106264-011-chi-nhanh-...
-DETAIL_LINK_RE = re.compile(r"^/[\d-]+-")
+LINK_RE = re.compile(r"^/([\d-]+)-")
 
 
 def digits_only(s: str) -> str:
-    """Lấy chuỗi chỉ gồm chữ số từ MST (bỏ dấu, khoảng trắng, ký tự khác)."""
     return re.sub(r"\D", "", s or "")
 
 
-def extract_company_data_from_detail(
-    detail_url: str,
-    raw_tax_id: str,
-    timeout: float,
-) -> Optional[Dict[str, str]]:
+def get_tax_id_from_url(url: str) -> Optional[str]:
     """
-    Truy cập trang chi tiết, kiểm tra 'Mã số thuế' trên trang có khớp với
-    MST đầu vào (sau khi bỏ dấu) không. Nếu KHÔNG khớp → trả None.
-    Nếu khớp → trả dict dữ liệu đầy đủ (bao gồm Trạng thái, Địa chỉ, ...).
+    Lấy MST từ URL: /0100105052-011-chi-nhanh-...
     """
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "vi-VN,vi;q=0.9"}
+    m = LINK_RE.match(url)
+    if not m:
+        return None
+    return m.group(1)  # "0100105052-011"
+
+
+def fetch_detail(detail_url: str, raw_tax_id: str, timeout: float):
+    """
+    Truy cập trang chi tiết và đọc dữ liệu.
+    Không còn tìm MST trong <table> vì HTML đã thay đổi.
+    Chỉ cần so MST từ URL.
+    """
+    headers = {"User-Agent": USER_AGENT}
     resp = requests.get(detail_url, headers=headers, timeout=timeout)
     if resp.status_code != 200:
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    data: Dict[str, str] = {
+    data = {
         "raw_tax_id": raw_tax_id,
-        "masothue_url": detail_url,
+        "masothue_url": detail_url
     }
 
-    # Lấy tên doanh nghiệp (h1)
-    title = soup.find("h1")
-    if title:
-        data["Tên doanh nghiệp"] = title.get_text(strip=True)
+    # Tên doanh nghiệp (thường ở <h1>)
+    h1 = soup.find("h1")
+    if h1:
+        data["Tên doanh nghiệp"] = h1.get_text(strip=True)
 
-    # Quét tất cả các bảng 2 cột để lấy thông tin
-    tax_id_on_page: Optional[str] = None
-
+    # Lấy bảng dữ liệu
     tables = soup.find_all("table")
-    for table in tables:
-        for row in table.find_all("tr"):
-            cells = row.find_all(["th", "td"])
-            if len(cells) != 2:
-                continue
-            label = cells[0].get_text(" ", strip=True)
-            value = cells[1].get_text(" ", strip=True)
-            if not label:
-                continue
-
-            # Lưu MST từ trang
-            if "Mã số thuế" in label and not tax_id_on_page:
-                tax_id_on_page = value
-
-            # Lưu các trường khác (Trạng thái, Địa chỉ, ...)
-            if label not in data:
-                data[label] = value
-
-    # Nếu không đọc được MST trên trang → coi như không hợp lệ
-    if not tax_id_on_page:
-        return None
-
-    data["tax_id_on_page"] = tax_id_on_page
-
-    # So sánh MST chỉ theo chữ số (bỏ dấu, bỏ khoảng trắng)
-    input_digits = digits_only(raw_tax_id)
-    page_digits = digits_only(tax_id_on_page)
-
-    if not input_digits or not page_digits or input_digits != page_digits:
-        # Không khớp MST → không dùng kết quả này
-        return None
-
-    # Có ít nhất MST hợp lệ + vài trường nữa thì mới coi là có dữ liệu
-    if len(data) <= 3:  # raw_tax_id, masothue_url, tax_id_on_page
-        return None
+    for tb in tables:
+        for tr in tb.find_all("tr"):
+            tds = tr.find_all(["th", "td"])
+            if len(tds) == 2:
+                label = tds[0].get_text(" ", strip=True)
+                value = tds[1].get_text(" ", strip=True)
+                if label not in data:
+                    data[label] = value
 
     return data
 
 
 def fetch_tax_info(raw_tax_id: str, timeout: float = 15.0) -> Dict[str, str]:
     """
-    Fetch details for a single tax ID.
-
     Quy trình:
-    1. Gọi trang search:  https://masothue.com/Search/?q=<raw_tax_id>
-    2. Lấy danh sách các link chi tiết ứng viên.
-    3. Lần lượt vào từng link, đọc 'Mã số thuế' trên trang và so sánh với MST đầu vào
-       (so sánh theo chữ số). Chỉ khi KHỚP mới trả dữ liệu.
+    1. Query search
+    2. Lấy tất cả link chi tiết
+    3. Chọn link nào có MST trong URL trùng (theo digits)
+    4. Scrape dữ liệu
     """
-
     query = raw_tax_id.strip()
     if not query:
-        raise ScrapeError("Mã số thuế rỗng.")
+        raise ScrapeError("MST rỗng")
 
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "vi-VN,vi;q=0.9"}
-
-    # BƯỚC 1: TÌM CÁC LINK ỨNG VIÊN QUA TRANG SEARCH
+    headers = {"User-Agent": USER_AGENT}
     search_url = f"{BASE_URL}/Search/?q={query}"
-    search_resp = requests.get(search_url, headers=headers, timeout=timeout)
-    if search_resp.status_code != 200:
-        raise ScrapeError(
-            f"Không thể tải trang tìm kiếm {search_url} (mã {search_resp.status_code})."
-        )
+    resp = requests.get(search_url, headers=headers, timeout=timeout)
+    if resp.status_code != 200:
+        raise ScrapeError("Không tải được trang Search")
 
-    search_soup = BeautifulSoup(search_resp.text, "html.parser")
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    candidate_links: List[str] = []
-    for a in search_soup.find_all("a", href=True):
+    input_digits = digits_only(raw_tax_id)
+
+    # Thu link ứng viên
+    links = []
+    for a in soup.find_all("a", href=True):
         href = a["href"]
-        if DETAIL_LINK_RE.match(href):
-            if href not in candidate_links:
-                candidate_links.append(href)
+        if LINK_RE.match(href):
+            links.append(href)
 
-    if not candidate_links:
-        raise ScrapeError(
-            f"Không tìm thấy bất kỳ link chi tiết nào cho MST {raw_tax_id} trên {search_url}."
-        )
+    if not links:
+        raise ScrapeError(f"Không tìm thấy link cho {raw_tax_id}")
 
-    # BƯỚC 2: LẦN LƯỢT THỬ TỪNG LINK, CHỈ GIỮ LINK CÓ MST TRÊN TRANG KHỚP VỚI INPUT
-    for href in candidate_links[:20]:  # giới hạn tối đa 20 link để tránh quá tải
-        detail_url = href if href.startswith("http") else BASE_URL + href
-        info = extract_company_data_from_detail(detail_url, raw_tax_id, timeout=timeout)
-        if info is not None:
-            return info
+    # Chọn đúng link theo MST trong URL
+    for href in links:
+        mst_in_url = get_tax_id_from_url(href)
+        if not mst_in_url:
+            continue
 
-    # Nếu duyệt hết mà không có link nào MST khớp → báo lỗi
-    raise ScrapeError(
-        f"Không tìm thấy kết quả có MST khớp với {raw_tax_id} trên masothue.com."
-    )
+        # So theo digits
+        if digits_only(mst_in_url) == input_digits:
+            detail_url = href if href.startswith("http") else BASE_URL + href
+            data = fetch_detail(detail_url, raw_tax_id, timeout)
+            if data:
+                return data
+
+    raise ScrapeError(f"Không có link MST khớp với {raw_tax_id}")
 
 
-def enrich_excel(
-    input_path: str,
-    output_path: str,
-    column: str = "tax_id",
-    sheet: str | int = 0,
-    delay: float = 1.0,
-    timeout: float = 15.0,
-) -> pd.DataFrame:
-    """
-    Read the Excel file, fetch each tax ID's info, and write results to a new file.
-    """
-
+def enrich_excel(input_path, output_path, column, sheet, delay, timeout):
     df = pd.read_excel(input_path, sheet_name=sheet)
     if column not in df.columns:
-        raise ValueError(
-            f"Không tìm thấy cột '{column}' trong file Excel. Các cột có: {list(df.columns)}"
-        )
+        raise ValueError(f"Không thấy cột {column}")
 
-    results: List[Dict[str, str]] = []
+    results = []
     total = len(df[column])
 
-    for idx, raw_value in enumerate(df[column], start=1):
-        raw_tax_id = str(raw_value).strip()
-        if not raw_tax_id:
+    for idx, raw in enumerate(df[column], start=1):
+        tax_id = str(raw).strip()
+        if not tax_id:
             continue
         try:
-            info = fetch_tax_info(raw_tax_id, timeout=timeout)
+            info = fetch_tax_info(tax_id, timeout)
             results.append(info)
-            print(
-                f"[{idx}/{total}] ✅ {raw_tax_id} → "
-                f"{info.get('Tên doanh nghiệp', 'đã lấy dữ liệu')}"
-            )
-        except Exception as exc:  # noqa: BLE001 - log mọi lỗi scrape
-            print(f"[{idx}/{total}] ❌ {raw_tax_id}: {exc}")
+            print(f"[{idx}/{total}] ✅ {tax_id}")
+        except Exception as e:
+            print(f"[{idx}/{total}] ❌ {tax_id}: {e}")
+
         time.sleep(delay)
 
     if not results:
-        raise ScrapeError("Không lấy được dữ liệu nào. Vui lòng kiểm tra danh sách mã.")
+        raise ScrapeError("Không có dữ liệu nào.")
 
-    results_df = pd.DataFrame(results)
-
-    # Join theo cột gốc (tax_id) ↔ raw_tax_id để giữ nguyên dữ liệu input
-    output_df = df.merge(
-        results_df,
+    out_df = df.merge(
+        pd.DataFrame(results),
         how="left",
         left_on=column,
-        right_on="raw_tax_id",
+        right_on="raw_tax_id"
     )
-    output_df.to_excel(output_path, index=False)
-    print(f"Đã lưu kết quả vào {output_path}")
-    return output_df
+    out_df.to_excel(output_path, index=False)
+    print("Đã lưu:", output_path)
+    return out_df
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv=None):
     args = parse_args(argv)
     try:
         enrich_excel(
-            input_path=args.input,
-            output_path=args.output,
-            column=args.column,
-            sheet=args.sheet,
-            delay=args.delay,
-            timeout=args.timeout,
+            args.input, args.output, args.column, args.sheet,
+            args.delay, args.timeout
         )
-        return 0
-    except Exception as exc:  # noqa: BLE001 - CLI entry point should show any error
-        print(exc, file=sys.stderr)
+    except Exception as e:
+        print(e, file=sys.stderr)
         return 1
+    return 0
 
 
 if __name__ == "__main__":
