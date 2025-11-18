@@ -1,8 +1,9 @@
 """
 Scraper masothue.com:
 - Đọc danh sách MST từ file Excel
-- Với mỗi MST -> gọi endpoint auto search -> lấy link chi tiết
-- Vào trang chi tiết đó, lấy thông tin và ghi ra file Excel mới
+- Với mỗi MST -> gọi https://masothue.com/Search/?type=auto&q=<MST>
+  (trả về luôn trang chi tiết)
+- Parse HTML, lấy thông tin và ghi ra file Excel mới
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--sheet",
         default=0,
-        help="Tên hoặc index sheet (mặc định: 0).",
+        help="Tên hoặc index sheet cần đọc (mặc định: 0).",
     )
     parser.add_argument(
         "--output",
@@ -66,59 +67,37 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def find_detail_url_for_tax_id(tax_id: str, timeout: float = 15.0) -> str:
-    """
-    Gọi endpoint auto search của masothue:
-      https://masothue.com/Search/?type=auto&q=<MST>
-    Sau đó tìm <a href="..."> có chứa '/<MST>-' trong href.
-    Ví dụ:
-      tax_id = '0100106264'
-      href   = '/0100106264-cong-ty-co-phan-van-tai-duong-sat-ha-noi'
-    """
-
-    # dùng endpoint type=auto đúng như trong JSON-LD của site
-    search_url = f"{BASE_URL}/Search/?type=auto&q={tax_id}"
-    resp = requests.get(search_url, headers=HEADERS, timeout=timeout)
-    if resp.status_code != 200:
-        raise ScrapeError(f"Không tải được {search_url} (HTTP {resp.status_code})")
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    needle = f"/{tax_id}-"  # chuỗi cần tìm trong href
-
-    candidate = None
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if needle in href:
-            candidate = href
-            break
-
-    if candidate is None:
-        raise ScrapeError(f"Không tìm thấy link chứa MST {tax_id} trên trang auto search.")
-
-    if candidate.startswith("http"):
-        return candidate
-    return BASE_URL + candidate
-
-
 def fetch_tax_info(tax_id: str, timeout: float = 15.0) -> Dict[str, str]:
     """
-    Từ MST:
-      1. Tìm URL chi tiết bằng find_detail_url_for_tax_id()
-      2. Vào URL, parse HTML, lấy thông tin bảng 2 cột
+    Gọi trực tiếp:
+      https://masothue.com/Search/?type=auto&q=<tax_id>
+
+    Endpoint này (theo đúng HTML bạn gửi) trả về luôn trang chi tiết.
+    Từ đó parse:
+    - <h1>: Tên doanh nghiệp
+    - Các bảng 2 cột: 'Mã số thuế', 'Trạng thái', 'Địa chỉ', ...
     """
 
-    detail_url = find_detail_url_for_tax_id(tax_id, timeout=timeout)
+    tax_id = tax_id.strip()
+    if not tax_id:
+        raise ScrapeError("MST rỗng.")
 
-    resp = requests.get(detail_url, headers=HEADERS, timeout=timeout)
+    url = f"{BASE_URL}/Search/?type=auto&q={tax_id}"
+    resp = requests.get(url, headers=HEADERS, timeout=timeout)
     if resp.status_code != 200:
-        raise ScrapeError(f"Không tải được {detail_url} (HTTP {resp.status_code})")
+        raise ScrapeError(f"Không tải được {url} (HTTP {resp.status_code}).")
 
     soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Kiểm tra MST có xuất hiện trong trang không (cho chắc)
+    page_text = soup.get_text(" ", strip=True)
+    if tax_id.replace("-", "") not in page_text.replace("-", ""):
+        # Không tìm thấy MST trong text -> rất có thể link sai
+        raise ScrapeError(f"Không thấy MST {tax_id} trong nội dung trang.")
 
     data: Dict[str, str] = {
         "tax_id": tax_id,
-        "masothue_url": detail_url,
+        "masothue_url": resp.url,  # URL thực tế (có thể đã canonical/redirect)
     }
 
     # Tên doanh nghiệp: thường là <h1>
@@ -126,7 +105,7 @@ def fetch_tax_info(tax_id: str, timeout: float = 15.0) -> Dict[str, str]:
     if title:
         data["Tên doanh nghiệp"] = title.get_text(strip=True)
 
-    # Lấy các bảng dạng 2 cột
+    # Các bảng 2 cột
     for table in soup.find_all("table"):
         for tr in table.find_all("tr"):
             tds = tr.find_all(["th", "td"])
@@ -138,7 +117,6 @@ def fetch_tax_info(tax_id: str, timeout: float = 15.0) -> Dict[str, str]:
                 data[label] = value
 
     if len(data) <= 2:
-        # chỉ có tax_id + masothue_url -> coi như không có dữ liệu
         raise ScrapeError(f"Không đọc được dữ liệu hữu ích cho MST {tax_id}.")
 
     return data
