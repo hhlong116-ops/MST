@@ -6,6 +6,7 @@ and export the results to an Excel spreadsheet.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from typing import Dict, List, Optional
@@ -70,26 +71,66 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+DETAIL_PATH_RE = re.compile(r"^/\d{8,15}-")  # ví dụ: /1701736840-cong-ty-...
+
+
 def fetch_tax_info(tax_id: str, timeout: float = 15.0) -> Dict[str, str]:
     """
     Fetch details for a single tax ID.
 
-    The function is resilient to small HTML changes by collecting all two-column
-    table rows (th/td or td/td) into a dictionary.
+    Quy trình:
+    1. Gọi trang search:  https://masothue.com/Search/?q=<tax_id>
+    2. Lấy link kết quả đầu tiên dạng /<MST>-ten-cong-ty
+    3. Truy cập trang chi tiết đó để đọc dữ liệu.
+
+    Hàm vẫn thu thập tất cả các dòng bảng 2 cột (th/td hoặc td/td)
+    thành một dict {label: value}.
     """
 
-    url = f"{BASE_URL}/{tax_id}"
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "vi-VN,vi;q=0.9"}
-    response = requests.get(url, headers=headers, timeout=timeout)
 
-    if response.status_code != 200:
-        raise ScrapeError(f"Không thể tải {url} (mã {response.status_code}).")
+    # BƯỚC 1: TÌM URL CHI TIẾT QUA TRANG SEARCH
+    search_url = f"{BASE_URL}/Search/?q={tax_id}"
+    search_resp = requests.get(search_url, headers=headers, timeout=timeout)
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    if search_resp.status_code != 200:
+        raise ScrapeError(
+            f"Không thể tải trang tìm kiếm {search_url} (mã {search_resp.status_code})."
+        )
+
+    search_soup = BeautifulSoup(search_resp.text, "html.parser")
+
+    detail_path: Optional[str] = None
+
+    # Cố gắng tìm link kết quả đầu tiên có dạng /<MST>-ten-cong-ty
+    for a in search_soup.find_all("a", href=True):
+        href = a["href"]
+        if DETAIL_PATH_RE.match(href):
+            detail_path = href
+            break
+
+    if not detail_path:
+        raise ScrapeError(
+            f"Không tìm thấy kết quả phù hợp cho mã {tax_id} trên {search_url}."
+        )
+
+    if detail_path.startswith("http"):
+        detail_url = detail_path
+    else:
+        detail_url = BASE_URL + detail_path
+
+    # BƯỚC 2: TRUY CẬP TRANG CHI TIẾT
+    detail_resp = requests.get(detail_url, headers=headers, timeout=timeout)
+    if detail_resp.status_code != 200:
+        raise ScrapeError(
+            f"Không thể tải {detail_url} (mã {detail_resp.status_code})."
+        )
+
+    soup = BeautifulSoup(detail_resp.text, "html.parser")
 
     # Lấy tên doanh nghiệp nếu có.
     title = soup.find("h1")
-    data: Dict[str, str] = {"tax_id": tax_id}
+    data: Dict[str, str] = {"tax_id": tax_id, "masothue_url": detail_url}
     if title:
         data["Tên doanh nghiệp"] = title.get_text(strip=True)
 
@@ -105,8 +146,10 @@ def fetch_tax_info(tax_id: str, timeout: float = 15.0) -> Dict[str, str]:
             if label and label not in data:
                 data[label] = value
 
-    if len(data) == 1:  # chỉ chứa tax_id
-        raise ScrapeError(f"Không tìm thấy dữ liệu cho mã {tax_id} tại {url}.")
+    if len(data) <= 2:  # chỉ có tax_id và masothue_url
+        raise ScrapeError(
+            f"Không tìm thấy dữ liệu bảng cho mã {tax_id} tại {detail_url}."
+        )
 
     return data
 
@@ -130,16 +173,21 @@ def enrich_excel(
         )
 
     results: List[Dict[str, str]] = []
-    for idx, tax_id in enumerate(df[column].astype(str)):
-        tax_id = tax_id.strip()
+    total = len(df[column])
+
+    for idx, raw_value in enumerate(df[column].astype(str), start=1):
+        tax_id = raw_value.strip()
         if not tax_id:
             continue
         try:
             info = fetch_tax_info(tax_id, timeout=timeout)
             results.append(info)
-            print(f"[{idx+1}/{len(df)}] ✅ {tax_id} - {info.get('Tên doanh nghiệp', 'đã lấy dữ liệu')}")
+            print(
+                f"[{idx}/{total}] ✅ {tax_id} - "
+                f"{info.get('Tên doanh nghiệp', 'đã lấy dữ liệu')}"
+            )
         except Exception as exc:  # noqa: BLE001 - want to show any scraping error
-            print(f"[{idx+1}/{len(df)}] ❌ {tax_id}: {exc}")
+            print(f"[{idx}/{total}] ❌ {tax_id}: {exc}")
         time.sleep(delay)
 
     if not results:
